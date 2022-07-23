@@ -62,7 +62,7 @@ def parse_order_event(b: bytes):
 
 
 @asynccontextmanager
-async def kafka_context():
+async def kafka_producer():
     producer = AIOKafkaProducer(
         bootstrap_servers="kafka:9092",
         client_id="saga-web",
@@ -70,6 +70,16 @@ async def kafka_context():
         value_serializer=lambda o: o.json().encode("utf-8"),
     )
 
+    await producer.start()
+
+    try:
+        yield producer
+    finally:
+        await producer.stop()
+
+
+@asynccontextmanager
+async def kafka_consumer():
     consumer = AIOKafkaConsumer(
         "orders",
         bootstrap_servers="kafka:9092",
@@ -78,13 +88,11 @@ async def kafka_context():
         value_deserializer=parse_order_event,
     )
 
-    await producer.start()
     await consumer.start()
 
     try:
-        yield producer, consumer
+        yield consumer
     finally:
-        await producer.stop()
         await consumer.stop()
 
 
@@ -95,51 +103,57 @@ async def create_order(order: Order, response: Response):
     request_id = uuid4()
     logger.info(f"{request_id} create order")
 
-    async with kafka_context() as (producer, consumer):
+    async with kafka_producer() as producer:
+        async with kafka_consumer() as consumer:
 
-        # Send order.create event
-        await producer.send(
-            "orders",
-            key=order.id,
-            value=OrderCreate(
-                request_id=request_id,
-                id=order.id,
-                line_items=order.line_items,
-            ),
-        )
-
-        async def wait_for_confirmation() -> str:
-            """Consume events until order is confirmed or denied."""
-
-            async for event in consumer:
-                if event.value.type == "order.confirm" and event.value.id == order.id:
-                    return "confirmed"
-                elif event.value.type == "order.deny" and event.value.id == order.id:
-                    return "denied"
-
-        try:
-            # Wait 15 seconds for order to be confirmed
-            status = await asyncio.wait_for(wait_for_confirmation(), 15)
-        except asyncio.TimeoutError:
-            status = "timeout"
-
-        if status == "confirmed":
-            response.status_code = 201
-            return order
-        elif status == "denied":
-            return Response(status_code=422)
-        elif status == "timeout":
-            # Cancel order if not confirmed in time
-            logger.info(f"{request_id} order canceled due to timeout")
+            # Send order.create event
             await producer.send(
                 "orders",
                 key=order.id,
-                value=OrderCancel(
-                    id=order.id,
+                value=OrderCreate(
                     request_id=request_id,
+                    id=order.id,
+                    line_items=order.line_items,
                 ),
             )
-            return Response(status_code=503)
+
+            async def wait_for_confirmation() -> str:
+                """Consume events until order is confirmed or denied."""
+
+                async for event in consumer:
+                    if (
+                        event.value.type == "order.confirm"
+                        and event.value.id == order.id
+                    ):
+                        return "confirmed"
+                    elif (
+                        event.value.type == "order.deny" and event.value.id == order.id
+                    ):
+                        return "denied"
+
+            try:
+                # Wait 15 seconds for order to be confirmed
+                status = await asyncio.wait_for(wait_for_confirmation(), 15)
+            except asyncio.TimeoutError:
+                status = "timeout"
+
+            if status == "confirmed":
+                response.status_code = 201
+                return order
+            elif status == "denied":
+                return Response(status_code=422)
+            elif status == "timeout":
+                # Cancel order if not confirmed in time
+                logger.info(f"{request_id} order canceled due to timeout")
+                await producer.send(
+                    "orders",
+                    key=order.id,
+                    value=OrderCancel(
+                        id=order.id,
+                        request_id=request_id,
+                    ),
+                )
+                return Response(status_code=503)
 
 
 @app.get("/")

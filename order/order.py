@@ -54,15 +54,7 @@ def parse_order_event(b: bytes):
 
 
 @asynccontextmanager
-async def kafka_context():
-    consumer = AIOKafkaConsumer(
-        "orders",
-        bootstrap_servers="kafka:9092",
-        client_id="order",
-        key_deserializer=lambda b: UUID(b.decode("utf-8")),
-        value_deserializer=parse_order_event,
-    )
-
+async def kafka_producer():
     producer = AIOKafkaProducer(
         bootstrap_servers="kafka:9092",
         client_id="order",
@@ -71,33 +63,52 @@ async def kafka_context():
     )
 
     await producer.start()
+
+    try:
+        yield producer
+    finally:
+        await producer.stop()
+
+
+@asynccontextmanager
+async def kafka_consumer():
+    consumer = AIOKafkaConsumer(
+        "orders",
+        bootstrap_servers="kafka:9092",
+        client_id="order",
+        key_deserializer=lambda b: UUID(b.decode("utf-8")),
+        value_deserializer=parse_order_event,
+    )
+
     await consumer.start()
 
     try:
-        yield producer, consumer
+        yield consumer
     finally:
-        await producer.stop()
         await consumer.stop()
 
 
 async def main():
-    async with kafka_context() as (producer, consumer):
-        async for event in consumer:
-            if event.value.type == "order.create":
-                logger.info(f"{event.value.request_id} received create order")
-                if len(event.value.line_items) == 0:
-                    logger.info(f"{event.value.request_id} order deny")
-                    confirmation = OrderDeny(
-                        request_id=event.value.request_id,
-                        id=event.value.id,
+    async with kafka_producer() as producer:
+        async with kafka_consumer() as consumer:
+            async for event in consumer:
+                if event.value.type == "order.create":
+                    logger.info(f"{event.value.request_id} received create order")
+                    if len(event.value.line_items) == 0:
+                        logger.info(f"{event.value.request_id} order deny")
+                        confirmation = OrderDeny(
+                            request_id=event.value.request_id,
+                            id=event.value.id,
+                        )
+                    else:
+                        logger.info(f"{event.value.request_id} order confirm")
+                        confirmation = OrderConfirm(
+                            request_id=event.value.request_id,
+                            id=event.value.id,
+                        )
+                    await producer.send(
+                        "orders", key=event.value.id, value=confirmation
                     )
-                else:
-                    logger.info(f"{event.value.request_id} order confirm")
-                    confirmation = OrderConfirm(
-                        request_id=event.value.request_id,
-                        id=event.value.id,
-                    )
-                await producer.send("orders", key=event.value.id, value=confirmation)
 
 
 if __name__ == "__main__":
