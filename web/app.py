@@ -81,7 +81,7 @@ async def kafka_producer():
 @asynccontextmanager
 async def kafka_consumer():
     consumer = AIOKafkaConsumer(
-        "orders",
+        "orders.reply",
         bootstrap_servers="kafka:9092",
         client_id="saga-web",
         key_deserializer=lambda b: UUID(b.decode("utf-8")),

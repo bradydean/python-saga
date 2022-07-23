@@ -107,7 +107,7 @@ async def main():
                             id=event.value.id,
                         )
                     await producer.send(
-                        "orders", key=event.value.id, value=confirmation
+                        "orders.reply", key=event.value.id, value=confirmation
                     )
 
 
