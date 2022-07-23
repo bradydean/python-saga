@@ -6,6 +6,8 @@ import logging
 from fastapi import FastAPI, Response
 from uuid import UUID, uuid4
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+from contextlib import asynccontextmanager
+
 
 logging.basicConfig()
 logger = logging.getLogger("app")
@@ -59,13 +61,8 @@ def parse_order_event(b: bytes):
     return model[event["type"]](**event)
 
 
-@app.post("/orders")
-async def create_order(order: Order, response: Response):
-    """Create order using saga pattern."""
-
-    request_id = uuid4()
-    logger.info(f"{request_id} create order")
-
+@asynccontextmanager
+async def kafka_context():
     producer = AIOKafkaProducer(
         bootstrap_servers="kafka:9092",
         client_id="saga-web",
@@ -81,59 +78,67 @@ async def create_order(order: Order, response: Response):
         value_deserializer=parse_order_event,
     )
 
-    await producer.start()
-    await consumer.start()
+    try:
+        await producer.start()
+        await consumer.start()
+        yield producer, consumer
+    finally:
+        await producer.stop()
+        await consumer.stop()
 
-    # Send order.create event
-    await producer.send(
-        "orders",
-        key=order.id,
-        value=OrderCreate(
-            request_id=request_id,
-            id=order.id,
-            line_items=order.line_items,
-        ),
-    )
 
-    async def wait_for_confirmation() -> str:
-        """Consume events until order is confirmed or denied."""
+@app.post("/orders")
+async def create_order(order: Order, response: Response):
+    """Create order using saga pattern."""
 
-        try:
+    request_id = uuid4()
+    logger.info(f"{request_id} create order")
+
+    async with kafka_context() as (producer, consumer):
+
+        # Send order.create event
+        await producer.send(
+            "orders",
+            key=order.id,
+            value=OrderCreate(
+                request_id=request_id,
+                id=order.id,
+                line_items=order.line_items,
+            ),
+        )
+
+        async def wait_for_confirmation() -> str:
+            """Consume events until order is confirmed or denied."""
+
             async for event in consumer:
                 if event.value.type == "order.confirm" and event.value.id == order.id:
                     return "confirmed"
                 elif event.value.type == "order.deny" and event.value.id == order.id:
                     return "denied"
-        except asyncio.CancelledError:
-            await consumer.stop()
-            raise
 
-    try:
-        # Wait 15 seconds for order to be confirmed
-        status = await asyncio.wait_for(wait_for_confirmation(), 15)
-    except asyncio.TimeoutError:
-        status = "timeout"
+        try:
+            # Wait 15 seconds for order to be confirmed
+            status = await asyncio.wait_for(wait_for_confirmation(), 15)
+        except asyncio.TimeoutError:
+            status = "timeout"
 
-    if status == "confirmed":
-        await producer.stop()
-        response.status_code = 201
-        return order
-    elif status == "denied":
-        await producer.stop()
-        return Response(status_code=422)
-    elif status == "timeout":
-        # Cancel order if not confirmed in time
-        logger.info(f"{request_id} order canceled due to timeout")
-        await producer.send(
-            "orders",
-            key=order.id,
-            value=OrderCancel(
-                id=order.id,
-                request_id=request_id,
-            ),
-        )
-        await producer.stop()
-        return Response(status_code=503)
+        if status == "confirmed":
+            response.status_code = 201
+            return order
+        elif status == "denied":
+            return Response(status_code=422)
+        elif status == "timeout":
+            # Cancel order if not confirmed in time
+            logger.info(f"{request_id} order canceled due to timeout")
+            await producer.send(
+                "orders",
+                key=order.id,
+                value=OrderCancel(
+                    id=order.id,
+                    request_id=request_id,
+                ),
+            )
+            return Response(status_code=503)
 
 
 @app.get("/")
