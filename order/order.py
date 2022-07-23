@@ -70,9 +70,10 @@ async def kafka_context():
         value_serializer=lambda o: o.json().encode("utf-8"),
     )
 
+    await producer.start()
+    await consumer.start()
+
     try:
-        await producer.start()
-        await consumer.start()
         yield producer, consumer
     finally:
         await producer.stop()

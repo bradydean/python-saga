@@ -78,9 +78,10 @@ async def kafka_context():
         value_deserializer=parse_order_event,
     )
 
+    await producer.start()
+    await consumer.start()
+
     try:
-        await producer.start()
-        await consumer.start()
         yield producer, consumer
     finally:
         await producer.stop()
